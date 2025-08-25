@@ -1,0 +1,9 @@
+services:
+  yt2x:
+    build: .
+    env_file: .env
+    volumes:
+      - yt2x_state:/var/lib/yt2x
+    restart: unless-stopped
+volumes:
+  yt2x_state:

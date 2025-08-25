@@ -1,0 +1,15 @@
+[Unit]
+Description=YT -> X native teaser poster
+After=docker.service
+Requires=docker.service
+
+[Service]
+WorkingDirectory=/opt/yt2x
+Environment=COMPOSE_PROJECT_NAME=yt2x
+ExecStart=/usr/bin/docker compose up --build --remove-orphans
+ExecStop=/usr/bin/docker compose down
+Restart=always
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

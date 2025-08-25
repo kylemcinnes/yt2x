@@ -1,0 +1,46 @@
+name: Deploy
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Basic build check
+        run: |
+          npm ci
+          node -e "console.log('build ok')"
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            sudo bash -lc '
+              set -e
+              if [ ! -d /opt/yt2x ]; then mkdir -p /opt/yt2x; fi
+              cd /opt/yt2x
+              if [ ! -d .git ]; then
+                git init
+                git remote add origin $GITHUB_SERVER_URL/${{ github.repository }}
+                git fetch --all
+                git reset --hard origin/main
+              else
+                git fetch --all
+                git reset --hard origin/main
+              fi
+              if [ ! -f /etc/systemd/system/yt2x.service ]; then
+                cp systemd/yt2x.service /etc/systemd/system/
+                systemctl daemon-reload
+                systemctl enable yt2x
+              fi
+              systemctl restart yt2x || true
+              docker compose up -d --build
+            '
