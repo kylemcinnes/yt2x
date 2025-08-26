@@ -201,6 +201,8 @@ async function postToX({ title, videoId, clipPath }) {
 (async () => {
   while (true) {
     try {
+      console.log(`[yt2x] Polling feed at ${new Date().toISOString()} …`);
+      
       // Non-blocking identity check (allows YouTube polling to continue)
       await assertCorrectAccountNonBlocking();
       
@@ -209,6 +211,7 @@ async function postToX({ title, videoId, clipPath }) {
       const seen = fs.existsSync(STATE) ? fs.readFileSync(STATE, 'utf8').trim() : '';
 
       if (!videoId || videoId === seen) {
+        console.log('[yt2x] No new video. Sleeping…');
         await sleep(POLL_SECONDS * 1000);
         continue;
       }
