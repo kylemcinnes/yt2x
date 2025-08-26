@@ -29,6 +29,19 @@ const POLL_SECONDS = Number(process.env.POLL_SECONDS || 120); // how often to ch
 const MAX_RETRIES   = Number(process.env.MAX_RETRIES || 2);   // retry dl if yt-dlp hiccups
 const RETRY_DELAY_S = Number(process.env.RETRY_DELAY_S || 60);
 
+function jitter(ms) { return ms + Math.floor(Math.random() * 5000); } // +0–5s
+
+async function backoffOn429(e, where) {
+  const is429 = (e?.code === 429) || (e?.status === 429) || (e?.data?.status === 429);
+  if (!is429) throw e;
+  const resetMs = (e?.rateLimit?.reset * 1000) || 0;
+  const now = Date.now();
+  const waitMs = resetMs > now ? (resetMs - now) : (15 * 60 * 1000); // default 15 min
+  const sleepMs = jitter(waitMs);
+  console.warn(`[yt2x] 429 at ${where}. Sleeping ~${Math.round(sleepMs/1000)}s…`);
+  await sleep(sleepMs);
+}
+
 function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
 
 function ytdlpJson(url) {
@@ -89,16 +102,28 @@ async function assertCorrectAccount() {
 }
 
 async function getLatest() {
-  const res = await fetch(FEED, { headers: { 'User-Agent': 'yt2x/1.0' }});
-  if (!res.ok) throw new Error(`RSS fetch failed: ${res.status}`);
-  const xml = await res.text();
-  const parsed = new XMLParser().parse(xml);
-  const entry = parsed?.feed?.entry?.[0] || parsed?.entry?.[0] || parsed?.feed?.entry;
-  if (!entry) throw new Error('No entries in RSS');
-  const title = entry.title;
-  const videoId = entry['yt:videoId'];
-  if (!videoId) throw new Error('Missing yt:videoId in feed entry');
-  return { title, videoId };
+  try {
+    const res = await fetch(FEED, { headers: { 'User-Agent': 'yt2x/1.0' }});
+    if (!res.ok) {
+      if (res.status === 429) {
+        // bubble a recognizable 429
+        const err = new Error('RSS rate limited');
+        err.status = 429;
+        throw err;
+      }
+      throw new Error(`RSS fetch failed: ${res.status}`);
+    }
+    const xml = await res.text();
+    const parsed = new XMLParser().parse(xml);
+    const entry = parsed?.feed?.entry?.[0] || parsed?.entry?.[0] || parsed?.feed?.entry;
+    if (!entry) throw new Error('No entries in RSS');
+    const title = entry.title;
+    const videoId = entry['yt:videoId'];
+    if (!videoId) throw new Error('Missing yt:videoId in feed entry');
+    return { title, videoId };
+  } catch (e) {
+    throw e;
+  }
 }
 
 function ensureDirForState() {
@@ -116,9 +141,11 @@ async function postToX({ title, videoId, clipPath }) {
 }
 
 (async () => {
+  // Check identity once at startup
+  await assertCorrectAccount();
+  
   while (true) {
     try {
-      await assertCorrectAccount();    // if you added this earlier
       ensureDirForState();
       const { title, videoId } = await getLatest();
       const seen = fs.existsSync(STATE) ? fs.readFileSync(STATE, 'utf8').trim() : '';
@@ -137,13 +164,28 @@ async function postToX({ title, videoId, clipPath }) {
         }
 
         const text = `New: ${title} https://youtu.be/${videoId}`;
-        if (process.env.DRY_RUN === '1') {
-          console.log(`[DRY_RUN] Would post: ${text} (+ native video)`);
-        } else {
-          const mediaId = await client.v1.uploadMedia(paths.clip, { type: 'video/mp4' });
-          await client.v2.tweet({ text, media: { media_ids: [mediaId] } });
+        try {
+          if (process.env.DRY_RUN === '1') {
+            console.log(`[DRY_RUN] Would post: ${text} (+ native video)`);
+          } else {
+            const mediaId = await client.v1.uploadMedia(paths.clip, { type: 'video/mp4' });
+            await client.v2.tweet({ text, media: { media_ids: [mediaId] } });
+          }
+          fs.writeFileSync(STATE, videoId);
+        } catch (e) {
+          try { await backoffOn429(e, 'tweet'); continue; } catch(_) {}
+          // Fallback: at least post the link (but ONLY if not a live-upcoming)
+          if (paths !== null) {
+            const text = `New: ${title} https://youtu.be/${videoId}`;
+            if (process.env.DRY_RUN === '1') {
+              console.log(`[DRY_RUN] Would post fallback: ${text}`);
+              fs.writeFileSync(STATE, videoId);
+            } else {
+              try { await client.v2.tweet({ text }); fs.writeFileSync(STATE, videoId); }
+              catch (e2) { console.error('[yt2x] Fallback failed:', e2?.message || e2); }
+            }
+          }
         }
-        fs.writeFileSync(STATE, videoId);
       } catch (e) {
         console.error('[yt2x] Post failed:', e?.message || e);
         // Fallback: at least post the link (but ONLY if not a live-upcoming)
@@ -163,9 +205,13 @@ async function postToX({ title, videoId, clipPath }) {
       }
 
       await sleep(POLL_SECONDS * 1000);
-    } catch (fatal) {
-      console.error('[yt2x] Fatal loop error:', fatal?.message || fatal);
-      await sleep(POLL_SECONDS * 1000);
+    } catch (e) {
+      if ((e?.status === 429) || (e?.code === 429) || (e?.data?.status === 429)) {
+        await backoffOn429(e, 'RSS/X');
+        continue;
+      }
+      console.error('[yt2x] Fatal loop error:', e?.message || e);
+      await sleep(jitter(POLL_SECONDS * 1000));
     }
   }
 })();
