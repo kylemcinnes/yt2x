@@ -27,6 +27,9 @@ TEASER_SECONDS=90
 STATE_FILE=/var/lib/yt2x/last.txt
 X_EXPECTED_USERNAME=censoreddottv
 DRY_RUN=0
+POLL_SECONDS=120
+MAX_RETRIES=1
+RETRY_DELAY_S=60
 ```
 
 ## Local run (dev)
@@ -62,6 +65,22 @@ docker compose logs -f
 
 Data volume persists STATE_FILE so we don't double-post.
 
+### Continuous Operation
+
+The service now runs continuously and polls every `POLL_SECONDS` (default 120s):
+
+- **Automatic Detection**: Continuously monitors the YouTube channel RSS feed
+- **Live Stream Handling**: Skips upcoming lives, waits for actual content
+- **Retry Logic**: Automatically retries failed downloads with exponential backoff
+- **Never Exits**: Gracefully handles errors and continues running
+- **Health Monitoring**: Docker healthcheck ensures the service stays alive
+
+### Live Stream Behavior
+
+- **`is_upcoming`**: Service skips and retries later (no state written)
+- **`is_live`**: Downloads with `--live-from-start` for live content
+- **`not_live`**: Normal VOD download and processing
+
 ## Systemd (auto-restart on reboot)
 
 ```bash
@@ -88,12 +107,31 @@ Push to main; Actions will pull & restart the service.
 - **DRY_RUN Mode**: Set `DRY_RUN=1` to test without actually posting (logs what would be posted)
 - **Identity Verification**: Service verifies the authenticated user matches `X_EXPECTED_USERNAME` before posting
 
+## Troubleshooting
+
+### Validation Workflow
+
+1. **Leave the service running** - it will continuously poll every 2 minutes
+2. **When you see a new upload** on the YouTube channel, wait 1-2 minutes
+3. **Check the X feed** for @censoreddottv - if no video appears, investigate logs:
+   ```bash
+   docker compose logs --tail=200
+   ```
+
+### Common Issues
+
+- **"Live is upcoming"**: Service correctly skips upcoming streams, will retry when live starts
+- **Download failures**: Service automatically retries with exponential backoff
+- **Authentication errors**: Verify X credentials and `X_EXPECTED_USERNAME` match
+- **Missing posts**: Check logs for error messages and fallback behavior
+
 ## Notes
 
 - Keep teaser ≤120s for faster processing on X.
 - Exactly one YouTube link in the tweet text for clean preview.
 - If video upload fails, the service still posts a link-only tweet.
 - To rotate secrets, update `.env` and `docker compose up -d`.
+- Service runs continuously and never exits - perfect for production deployment.
 
 ## X App checklist (fill before testing)
 
