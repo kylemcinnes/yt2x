@@ -50,6 +50,19 @@ async function assertCorrectAccountNonBlocking() {
   }
 }
 
+async function waitForMediaReady(mediaId) {
+  // twitter-api-v2 exposes v1.request for raw calls if needed
+  for (let i = 0; i < 30; i++) {
+    const info = await client.v1.get('media/upload', { command: 'STATUS', media_id: mediaId });
+    const pi = info.processing_info;
+    if (!pi || pi.state === 'succeeded') return;
+    if (pi.state === 'failed') throw new Error(`Media processing failed: ${pi.error && pi.error.message}`);
+    const delay = (pi.check_after_secs || 2) * 1000;
+    await new Promise(r => setTimeout(r, delay));
+  }
+  throw new Error('Media processing timed out');
+}
+
 const POLL_SECONDS = Number(process.env.POLL_SECONDS || 120); // how often to check RSS
 const MAX_RETRIES   = Number(process.env.MAX_RETRIES || 2);   // retry dl if yt-dlp hiccups
 const RETRY_DELAY_S = Number(process.env.RETRY_DELAY_S || 60);
@@ -112,7 +125,15 @@ async function downloadAndClip(id, secs) {
     }
   }
 
-  tryExec(`ffmpeg -y -ss 0 -t ${secs} -i "${id}.mp4" -c copy clip.mp4`);
+  // Transcode to X-friendly MP4 (H.264 yuv420p, AAC-LC, progressive, closed GOP)
+  execSync(
+    `ffmpeg -y -ss 0 -t ${secs} -i "${id}.mp4" ` +
+    `-vf "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease,fps=30" ` +
+    `-c:v libx264 -profile:v high -pix_fmt yuv420p -preset veryfast ` +
+    `-movflags +faststart -g 60 -keyint_min 60 -sc_threshold 0 ` +
+    `-c:a aac -b:a 128k -ac 2 -ar 44100 clip.mp4`,
+    { stdio: 'inherit' }
+  );
   return { original: `${id}.mp4`, clip: 'clip.mp4' };
 }
 
@@ -213,7 +234,8 @@ async function postToX({ title, videoId, clipPath }) {
           if (process.env.DRY_RUN === '1') {
             console.log(`[DRY_RUN] Would post: ${text} (+ native video)`);
           } else {
-            const mediaId = await client.v1.uploadMedia(paths.clip, { type: 'video/mp4' });
+            const mediaId = await client.v1.uploadMedia(paths.clip, { mimeType: 'video/mp4' });
+            await waitForMediaReady(mediaId);
             await client.v2.tweet({ text, media: { media_ids: [mediaId] } });
           }
           fs.writeFileSync(STATE, videoId);
