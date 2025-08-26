@@ -44,6 +44,43 @@ node src/index.mjs
 
 If a new video exists, it will post once and exit.
 
+### Local 24/7 Operation (Recommended)
+
+For continuous operation on your Mac:
+
+#### 1. Enable Docker Desktop Auto-Start
+- **Docker Desktop** → **Settings** → **General** → Check **"Start Docker Desktop when you log in"**
+
+#### 2. Add Auto-Start Script to Login Items
+```bash
+# The script is already created at ~/bin/start-yt2x.sh
+# Add it to Login Items: System Preferences → Users & Groups → Login Items
+```
+
+#### 3. Use the Local Control Script
+```bash
+# Start the service (with auto-restart)
+./local-control.sh start
+
+# Check status
+./local-control.sh status
+
+# Follow logs
+./local-control.sh logs
+
+# Force re-check for new videos
+./local-control.sh force-check
+
+# Stop service
+./local-control.sh stop
+```
+
+#### 4. Service Behavior
+- **Auto-restart**: Service restarts automatically if it crashes
+- **Persistent state**: Video tracking persists across restarts
+- **Sleep handling**: Service resumes when Mac wakes up
+- **Continuous polling**: Checks YouTube every 3 minutes for new uploads
+
 ### Testing with DRY_RUN
 
 For safe testing, set `DRY_RUN=1` in your `.env`:
