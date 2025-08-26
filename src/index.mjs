@@ -93,10 +93,22 @@ async function downloadAndClip(id, secs) {
 
 async function assertCorrectAccount() {
   if (!EXPECTED) return;
-  const me = await client.v2.me();
-  const actual = (me.data?.username || '').toLowerCase();
-  if (actual !== EXPECTED) {
-    console.error(`Refusing to post: authenticated user @${actual} != expected @${EXPECTED}`);
+  
+  try {
+    const me = await client.v2.me();
+    const actual = (me.data?.username || '').toLowerCase();
+    if (actual !== EXPECTED) {
+      console.error(`Refusing to post: authenticated user @${actual} != expected @${EXPECTED}`);
+      process.exit(2);
+    }
+    console.log(`[yt2x] ✅ Authenticated as @${actual}`);
+  } catch (e) {
+    if ((e?.code === 429) || (e?.status === 429) || (e?.data?.status === 429)) {
+      console.warn(`[yt2x] Rate limited during identity check, will retry in main loop`);
+      // Don't exit, let the main loop handle the 429
+      return;
+    }
+    console.error(`[yt2x] Identity check failed:`, e?.message || e);
     process.exit(2);
   }
 }
@@ -146,6 +158,25 @@ async function postToX({ title, videoId, clipPath }) {
   
   while (true) {
     try {
+      // Retry identity check if it failed due to rate limiting
+      if (EXPECTED) {
+        try {
+          const me = await client.v2.me();
+          const actual = (me.data?.username || '').toLowerCase();
+          if (actual !== EXPECTED) {
+            console.error(`Refusing to post: authenticated user @${actual} != expected @${EXPECTED}`);
+            process.exit(2);
+          }
+        } catch (e) {
+          if ((e?.code === 429) || (e?.status === 429) || (e?.data?.status === 429)) {
+            await backoffOn429(e, 'identity check');
+            continue;
+          }
+          console.error(`[yt2x] Identity check failed:`, e?.message || e);
+          process.exit(2);
+        }
+      }
+      
       ensureDirForState();
       const { title, videoId } = await getLatest();
       const seen = fs.existsSync(STATE) ? fs.readFileSync(STATE, 'utf8').trim() : '';
