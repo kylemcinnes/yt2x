@@ -25,6 +25,31 @@ const client = new TwitterApi({
 const EXPECTED = (process.env.X_EXPECTED_USERNAME || '').toLowerCase();
 const DRY = process.env.DRY_RUN === '1';
 
+let identityOk = false;
+let nextIdentityCheckAt = 0;
+
+async function assertCorrectAccountNonBlocking() {
+  if (process.env.SKIP_IDENTITY_CHECK === '1' || identityOk) return;
+  const now = Date.now();
+  if (now < nextIdentityCheckAt) return; // respect backoff
+
+  try {
+    const me = await client.v2.me();
+    const expected = (process.env.X_EXPECTED_USERNAME || '').toLowerCase();
+    const actual = (me.data?.username || '').toLowerCase();
+    if (expected && expected !== actual) {
+      throw new Error(`Authenticated @${actual} != expected @${expected}`);
+    }
+    identityOk = true;
+    console.log(`[yt2x] Identity confirmed as @${me.data?.username}`);
+  } catch (e) {
+    const resetMs = (e?.rateLimit?.reset ? e.rateLimit.reset * 1000 : Date.now() + 15*60*1000);
+    nextIdentityCheckAt = resetMs + Math.floor(Math.random() * 5000);
+    const code = e?.data?.status || e?.code || 'error';
+    console.warn(`[yt2x] Identity check deferred (${code}). Will retry after ${new Date(nextIdentityCheckAt).toISOString()}`);
+  }
+}
+
 const POLL_SECONDS = Number(process.env.POLL_SECONDS || 120); // how often to check RSS
 const MAX_RETRIES   = Number(process.env.MAX_RETRIES || 2);   // retry dl if yt-dlp hiccups
 const RETRY_DELAY_S = Number(process.env.RETRY_DELAY_S || 60);
@@ -153,29 +178,10 @@ async function postToX({ title, videoId, clipPath }) {
 }
 
 (async () => {
-  // Check identity once at startup
-  await assertCorrectAccount();
-  
   while (true) {
     try {
-      // Retry identity check if it failed due to rate limiting
-      if (EXPECTED) {
-        try {
-          const me = await client.v2.me();
-          const actual = (me.data?.username || '').toLowerCase();
-          if (actual !== EXPECTED) {
-            console.error(`Refusing to post: authenticated user @${actual} != expected @${EXPECTED}`);
-            process.exit(2);
-          }
-        } catch (e) {
-          if ((e?.code === 429) || (e?.status === 429) || (e?.data?.status === 429)) {
-            await backoffOn429(e, 'identity check');
-            continue;
-          }
-          console.error(`[yt2x] Identity check failed:`, e?.message || e);
-          process.exit(2);
-        }
-      }
+      // Non-blocking identity check (allows YouTube polling to continue)
+      await assertCorrectAccountNonBlocking();
       
       ensureDirForState();
       const { title, videoId } = await getLatest();
@@ -190,6 +196,14 @@ async function postToX({ title, videoId, clipPath }) {
       try {
         paths = await downloadAndClip(videoId, SECS);
         if (!paths) {                  // upcoming live → don't write state; just wait
+          await sleep(POLL_SECONDS * 1000);
+          continue;
+        }
+
+        // Gate posting on identity confirmation
+        if (!identityOk) {
+          console.log('[yt2x] Waiting for identity confirmation; skipping post this cycle.');
+          // do NOT write state, so we'll try again next poll
           await sleep(POLL_SECONDS * 1000);
           continue;
         }
