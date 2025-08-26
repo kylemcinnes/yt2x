@@ -4,6 +4,7 @@ services:
     env_file: .env
     volumes:
       - yt2x_state:/var/lib/yt2x
+      - ./cookies:/cookies:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pgrep -f 'node src/index.mjs' >/dev/null || exit 1"]

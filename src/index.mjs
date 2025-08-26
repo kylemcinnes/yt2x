@@ -6,6 +6,17 @@ import { XMLParser } from 'fast-xml-parser';
 import { execSync } from 'child_process';
 import { TwitterApi } from 'twitter-api-v2';
 
+const COOKIES_FILE = '/cookies/youtube.txt';
+const HAS_COOKIES = fs.existsSync(COOKIES_FILE);
+const COOKIES_ARG = HAS_COOKIES ? `--cookies ${COOKIES_FILE}` : '';
+const UA_ARG = '--user-agent "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"';
+
+function safeUpdateYtDlp() {
+  try {
+    execSync('yt-dlp -U --update-to nightly', { stdio: 'inherit' });
+  } catch { /* ignore */ }
+}
+
 const FEED = process.env.FEED_URL;
 const SECS = Number(process.env.TEASER_SECONDS ?? 90);
 const STATE = process.env.STATE_FILE || '/var/lib/yt2x/last.txt';
@@ -109,9 +120,11 @@ async function downloadAndClip(id, secs) {
     return null; // signal caller to skip but DO NOT write state
   }
 
+  safeUpdateYtDlp();
+
   const dlCmd = (status === 'is_live')
-    ? `yt-dlp --live-from-start -N 4 -o "${id}.mp4" "${url}"`
-    : `yt-dlp -f mp4 -o "${id}.mp4" "${url}"`;
+    ? `yt-dlp ${UA_ARG} ${COOKIES_ARG} --live-from-start -N 4 -o "${id}.mp4" "${url}"`
+    : `yt-dlp ${UA_ARG} ${COOKIES_ARG} -f "bv*[ext=mp4]+ba[ext=m4a]/mp4" -o "${id}.mp4" "${url}"`;
 
   // simple retry loop (yt-dlp can hiccup)
   for (let i = 0; i <= MAX_RETRIES; i++) {

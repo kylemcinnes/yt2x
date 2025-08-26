@@ -1,10 +1,11 @@
-# Use bookworm so apt has yt-dlp packaged
+# Use bookworm so apt has ffmpeg packaged
 FROM node:20-bookworm-slim
 
-# ffmpeg + yt-dlp from apt (no pip), plus certs for HTTPS
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      ffmpeg yt-dlp ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl \
+ && curl -L https://github.com/yt-dlp/yt-dlp-nightly/releases/latest/download/yt-dlp_nightly \
+      -o /usr/local/bin/yt-dlp \
+ && chmod a+rx /usr/local/bin/yt-dlp \
+ && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY package*.json ./
