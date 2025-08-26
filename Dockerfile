@@ -1,11 +1,13 @@
-FROM node:20-slim
+# Use bookworm so apt has yt-dlp packaged
+FROM node:20-bookworm-slim
 
-# OS deps for ffmpeg + yt-dlp
-RUN apt-get update && apt-get install -y ffmpeg python3-pip && rm -rf /var/lib/apt/lists/* \
- && pip3 install --no-cache-dir yt-dlp
+# ffmpeg + yt-dlp from apt (no pip), plus certs for HTTPS
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ffmpeg yt-dlp ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci
+RUN npm ci --omit=dev
 COPY . .
 CMD ["npm","start"]

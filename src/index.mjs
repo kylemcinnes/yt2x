@@ -25,6 +25,59 @@ const client = new TwitterApi({
 const EXPECTED = (process.env.X_EXPECTED_USERNAME || '').toLowerCase();
 const DRY = process.env.DRY_RUN === '1';
 
+const POLL_SECONDS = Number(process.env.POLL_SECONDS || 120); // how often to check RSS
+const MAX_RETRIES   = Number(process.env.MAX_RETRIES || 2);   // retry dl if yt-dlp hiccups
+const RETRY_DELAY_S = Number(process.env.RETRY_DELAY_S || 60);
+
+function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+function ytdlpJson(url) {
+  const out = execSync(`yt-dlp -J "${url}"`, { stdio: ['ignore','pipe','pipe'] }).toString();
+  return JSON.parse(out);
+}
+
+function getLiveStatus(videoId) {
+  try {
+    const info = ytdlpJson(`https://www.youtube.com/watch?v=${videoId}`);
+    return info.live_status || 'not_live'; // not_live | is_upcoming | is_live | was_live
+  } catch {
+    return 'unknown';
+  }
+}
+
+function tryExec(cmd) {
+  return execSync(cmd, { stdio: 'inherit' });
+}
+
+async function downloadAndClip(id, secs) {
+  const url = `https://www.youtube.com/watch?v=${id}`;
+  const status = getLiveStatus(id);
+
+  if (status === 'is_upcoming') {
+    console.log(`[yt2x] Live is upcoming for ${id}. Will retry later.`);
+    return null; // signal caller to skip but DO NOT write state
+  }
+
+  const dlCmd = (status === 'is_live')
+    ? `yt-dlp --live-from-start -N 4 -o "${id}.mp4" "${url}"`
+    : `yt-dlp -f mp4 -o "${id}.mp4" "${url}"`;
+
+  // simple retry loop (yt-dlp can hiccup)
+  for (let i = 0; i <= MAX_RETRIES; i++) {
+    try {
+      tryExec(dlCmd);
+      break;
+    } catch (e) {
+      if (i === MAX_RETRIES) throw e;
+      console.warn(`[yt2x] Download failed (attempt ${i+1}/${MAX_RETRIES+1}). Retrying in ${RETRY_DELAY_S}s…`);
+      await sleep(RETRY_DELAY_S * 1000);
+    }
+  }
+
+  tryExec(`ffmpeg -y -ss 0 -t ${secs} -i "${id}.mp4" -c copy clip.mp4`);
+  return { original: `${id}.mp4`, clip: 'clip.mp4' };
+}
+
 async function assertCorrectAccount() {
   if (!EXPECTED) return;
   const me = await client.v2.me();
@@ -53,13 +106,7 @@ function ensureDirForState() {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-function downloadAndClip(id) {
-  // 1) Download mp4 (best available) as {id}.mp4
-  execSync(`yt-dlp -f mp4 -o "${id}.mp4" "https://www.youtube.com/watch?v=${id}"`, { stdio: 'inherit' });
-  // 2) Clip first SECS seconds to clip.mp4 (stream copy to keep it fast)
-  execSync(`ffmpeg -y -ss 0 -t ${SECS} -i "${id}.mp4" -c copy clip.mp4`, { stdio: 'inherit' });
-  return { original: `${id}.mp4`, clip: 'clip.mp4' };
-}
+
 
 async function postToX({ title, videoId, clipPath }) {
   // Chunked media upload handled by v1 helper internally.
@@ -69,41 +116,56 @@ async function postToX({ title, videoId, clipPath }) {
 }
 
 (async () => {
-  await assertCorrectAccount();
-  ensureDirForState();
-  const { title, videoId } = await getLatest();
-
-  const seen = fs.existsSync(STATE) ? fs.readFileSync(STATE, 'utf8').trim() : '';
-  if (!videoId || videoId === seen) {
-    process.exit(0); // nothing to do
-  }
-
-  let paths;
-  try {
-    paths = downloadAndClip(videoId);
+  while (true) {
     try {
-      if (DRY) {
-        console.log(`[DRY_RUN] Would post: New: ${title} https://youtu.be/${videoId} (with native video)`);
-        fs.writeFileSync(STATE, videoId);
-      } else {
-        await postToX({ title, videoId, clipPath: paths.clip });
-        fs.writeFileSync(STATE, videoId);
+      await assertCorrectAccount();    // if you added this earlier
+      ensureDirForState();
+      const { title, videoId } = await getLatest();
+      const seen = fs.existsSync(STATE) ? fs.readFileSync(STATE, 'utf8').trim() : '';
+
+      if (!videoId || videoId === seen) {
+        await sleep(POLL_SECONDS * 1000);
+        continue;
       }
-    } catch (e) {
-      console.error('Media upload failed, falling back to link-only tweet:', e?.message || e);
-      // Fallback: post text-only with one YouTube link for card preview
-      const text = `New: ${title} https://youtu.be/${videoId}`;
-      if (DRY) {
-        console.log(`[DRY_RUN] Would post fallback: New: ${title} https://youtu.be/${videoId}`);
+
+      let paths;
+      try {
+        paths = await downloadAndClip(videoId, SECS);
+        if (!paths) {                  // upcoming live → don't write state; just wait
+          await sleep(POLL_SECONDS * 1000);
+          continue;
+        }
+
+        const text = `New: ${title} https://youtu.be/${videoId}`;
+        if (process.env.DRY_RUN === '1') {
+          console.log(`[DRY_RUN] Would post: ${text} (+ native video)`);
+        } else {
+          const mediaId = await client.v1.uploadMedia(paths.clip, { type: 'video/mp4' });
+          await client.v2.tweet({ text, media: { media_ids: [mediaId] } });
+        }
         fs.writeFileSync(STATE, videoId);
-      } else {
-        await client.v2.tweet({ text });
-        fs.writeFileSync(STATE, videoId);
+      } catch (e) {
+        console.error('[yt2x] Post failed:', e?.message || e);
+        // Fallback: at least post the link (but ONLY if not a live-upcoming)
+        if (paths !== null) {
+          const text = `New: ${title} https://youtu.be/${videoId}`;
+          if (process.env.DRY_RUN === '1') {
+            console.log(`[DRY_RUN] Would post fallback: ${text}`);
+            fs.writeFileSync(STATE, videoId);
+          } else {
+            try { await client.v2.tweet({ text }); fs.writeFileSync(STATE, videoId); }
+            catch (e2) { console.error('[yt2x] Fallback failed:', e2?.message || e2); }
+          }
+        }
+      } finally {
+        try { if (paths?.original) fs.unlinkSync(paths.original); } catch {}
+        try { if (paths?.clip) fs.unlinkSync(paths.clip); } catch {}
       }
+
+      await sleep(POLL_SECONDS * 1000);
+    } catch (fatal) {
+      console.error('[yt2x] Fatal loop error:', fatal?.message || fatal);
+      await sleep(POLL_SECONDS * 1000);
     }
-  } finally {
-    // Cleanup
-    try { if (paths?.original) fs.unlinkSync(paths.original); } catch {}
-    try { if (paths?.clip) fs.unlinkSync(paths.clip); } catch {}
   }
 })();
