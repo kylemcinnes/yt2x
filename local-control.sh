@@ -1,65 +1,74 @@
 #!/usr/bin/env bash
-# Local control script for yt2x service
-# Usage: ./local-control.sh [start|stop|logs|status|restart|force-check]
+set -euo pipefail
 
-set -e
+PROJECT_DIR="/Users/kylemcinnes/Git Repos/yt2x"
+COMPOSE="docker compose"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+cd "$PROJECT_DIR"
 
-case "${1:-help}" in
+wait_for_docker() {
+  for i in {1..30}; do
+    if docker info >/dev/null 2>&1; then return 0; fi
+    sleep 2
+  done
+  echo "Docker engine not ready after ~60s" >&2
+  return 1
+}
+
+usage() {
+  cat <<USAGE
+Usage: $0 {start|stop|restart|status|logs|force-check|rebuild|env}
+  start        Build (if needed) and start the watcher in background
+  stop         Stop the watcher
+  restart      Restart the watcher
+  status       Show compose status
+  logs         Follow logs
+  force-check  Clear last seen video so the watcher re-checks immediately
+  rebuild      Force rebuild image and restart
+  env          Print key env values currently in use
+USAGE
+}
+
+cmd=${1:-help}
+
+case "$cmd" in
   start)
-    echo "🚀 Starting yt2x service..."
-    docker compose up -d --build
-    echo "✅ Service started. Check status with: ./local-control.sh status"
+    wait_for_docker
+    $COMPOSE up -d --build
+    $COMPOSE ps
     ;;
   stop)
-    echo "🛑 Stopping yt2x service..."
-    docker compose down
-    echo "✅ Service stopped"
+    $COMPOSE down
     ;;
   restart)
-    echo "🔄 Restarting yt2x service..."
-    docker compose down
-    docker compose up -d --build
-    echo "✅ Service restarted"
-    ;;
-  logs)
-    echo "📋 Following yt2x logs (Ctrl+C to exit)..."
-    docker compose logs -f
+    wait_for_docker
+    $COMPOSE up -d --build
     ;;
   status)
-    echo "📊 yt2x service status:"
-    docker compose ps
-    echo ""
-    echo "📋 Recent logs:"
-    docker compose logs --tail=20
+    $COMPOSE ps
+    ;;
+  logs)
+    $COMPOSE logs -f
     ;;
   force-check)
-    echo "🔍 Forcing re-check of most recent video..."
-    docker compose exec yt2x rm -f /var/lib/yt2x/last.txt 2>/dev/null || echo "Container not running, starting service first..."
-    docker compose up -d --build
-    echo "✅ Service will now check for new videos on next poll cycle"
+    $COMPOSE exec yt2x rm -f /var/lib/yt2x/last.txt || true
+    echo "Cleared state; watcher will process the latest feed item on next poll."
     ;;
-  help|*)
-    echo "yt2x Local Control Script"
-    echo ""
-    echo "Usage: ./local-control.sh [command]"
-    echo ""
-    echo "Commands:"
-    echo "  start        - Start the service (with auto-restart)"
-    echo "  stop         - Stop the service"
-    echo "  restart      - Restart the service"
-    echo "  logs         - Follow logs in real-time"
-    echo "  status       - Show service status and recent logs"
-    echo "  force-check  - Force re-check for new videos"
-    echo "  help         - Show this help message"
-    echo ""
-    echo "Auto-start setup:"
-    echo "  1. Enable Docker Desktop auto-start: Docker Desktop → Settings → General → 'Start Docker Desktop when you log in'"
-    echo "  2. Add ~/bin/start-yt2x.sh to Login Items: System Preferences → Users & Groups → Login Items"
-    echo ""
-    echo "Current status:"
-    docker compose ps 2>/dev/null || echo "Service not running"
+  rebuild)
+    wait_for_docker
+    $COMPOSE build --no-cache
+    $COMPOSE up -d
+    ;;
+  env)
+    # print select env values without secrets
+    if [ -f ".env" ]; then
+      grep -E '^(FEED_URL|TEASER_SECONDS|POLL_SECONDS|MAX_RETRIES|RETRY_DELAY_S|DRY_RUN|X_EXPECTED_USERNAME|SKIP_IDENTITY_CHECK)=' .env || true
+    else
+      echo ".env not found"
+    fi
+    ;;
+  *)
+    usage
+    exit 1
     ;;
 esac
