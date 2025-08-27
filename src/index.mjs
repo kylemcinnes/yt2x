@@ -133,9 +133,6 @@ async function downloadAndClip(id, secs) {
 
   ensureYtDlpOk();
 
-  // seconds to grab
-  const secs = Number(SECS);
-
   // Build common args
   const COMMON = `${UA_ARG} ${COOKIES_ARG} -N 8 --concurrent-fragments 8 --no-part --no-playlist`;
   const URL = `https://www.youtube.com/watch?v=${id}`;
