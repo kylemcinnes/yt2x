@@ -72,18 +72,7 @@ async function assertCorrectAccountNonBlocking() {
   }
 }
 
-async function waitForMediaReady(mediaId) {
-  // twitter-api-v2 exposes v1.request for raw calls if needed
-  for (let i = 0; i < 30; i++) {
-    const info = await client.v1.get('media/upload', { command: 'STATUS', media_id: mediaId });
-    const pi = info.processing_info;
-    if (!pi || pi.state === 'succeeded') return;
-    if (pi.state === 'failed') throw new Error(`Media processing failed: ${pi.error && pi.error.message}`);
-    const delay = (pi.check_after_secs || 2) * 1000;
-    await new Promise(r => setTimeout(r, delay));
-  }
-  throw new Error('Media processing timed out');
-}
+
 
 const POLL_SECONDS = Number(process.env.POLL_SECONDS || 120); // how often to check RSS
 const MAX_RETRIES   = Number(process.env.MAX_RETRIES || 2);   // retry dl if yt-dlp hiccups
@@ -223,8 +212,8 @@ function ensureDirForState() {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-// Poll media processing until ready
-async function waitForMediaReady(mediaId) {
+// --- X media processing helper (single definition) ---
+async function waitForMediaReady(client, mediaId) {
   for (let i = 0; i < 40; i++) {
     const info = await client.v1.get('media/upload', { command: 'STATUS', media_id: mediaId });
     const pi = info.processing_info;
@@ -236,7 +225,8 @@ async function waitForMediaReady(mediaId) {
   throw new Error('Media processing timed out');
 }
 
-async function postToX({ title, videoId, clipPath }) {
+// --- Post to X with native video (single definition) ---
+async function postToX({ title, videoId, clipPath, client }) {
   const text = `${title}\n\nWatch full on YouTube: https://youtu.be/${videoId}`;
 
   if (process.env.DRY_RUN === '1') {
@@ -245,19 +235,12 @@ async function postToX({ title, videoId, clipPath }) {
   }
 
   try {
-    // 1) Upload video (chunked) via v1
     const mediaId = await client.v1.uploadMedia(clipPath, { mimeType: 'video/mp4' });
-
-    // 2) Wait for processing
-    await waitForMediaReady(mediaId);
-
-    // 3) Tweet with native video + YT link
+    await waitForMediaReady(client, mediaId);
     await client.v2.tweet({ text, media: { media_ids: [mediaId] } });
     console.log('[yt2x] Tweeted with native video.');
   } catch (e) {
     console.error('[yt2x] Native video tweet failed:', e?.data || e?.message || e);
-
-    // Optional: only allow link-only fallback if explicitly permitted
     if (process.env.ALLOW_LINK_FALLBACK === '1') {
       try {
         await client.v2.tweet({ text });
@@ -309,7 +292,7 @@ async function postToX({ title, videoId, clipPath }) {
         }
 
         try {
-          await postToX({ title, videoId, clipPath: paths.clip });
+          await postToX({ title, videoId, clipPath: paths.clip, client });
           fs.writeFileSync(STATE, videoId);
         } catch (e) {
           try { await backoffOn429(e, 'tweet'); continue; } catch(_) {}
