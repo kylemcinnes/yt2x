@@ -11,10 +11,21 @@ const HAS_COOKIES = fs.existsSync(COOKIES_FILE);
 const COOKIES_ARG = HAS_COOKIES ? `--cookies ${COOKIES_FILE}` : '';
 const UA_ARG = '--user-agent "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"';
 
-function safeUpdateYtDlp() {
+function ensureYtDlpOk() {
   try {
-    execSync('yt-dlp -U --update-to nightly', { stdio: 'inherit' });
-  } catch { /* ignore */ }
+    execSync('yt-dlp --version', { stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch {
+    console.error('[yt2x] yt-dlp missing/corrupt; attempting recovery...');
+    try {
+      execSync(
+        'curl -fsSL -o /usr/local/bin/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp && chmod a+rx /usr/local/bin/yt-dlp && yt-dlp --version',
+        { stdio: 'inherit' }
+      );
+    } catch (e) {
+      console.error('[yt2x] yt-dlp recovery failed.');
+      throw e;
+    }
+  }
 }
 
 const FEED = process.env.FEED_URL;
@@ -120,11 +131,28 @@ async function downloadAndClip(id, secs) {
     return null; // signal caller to skip but DO NOT write state
   }
 
-  safeUpdateYtDlp();
+  ensureYtDlpOk();
 
-  const dlCmd = (status === 'is_live')
-    ? `yt-dlp ${UA_ARG} ${COOKIES_ARG} --live-from-start -N 4 -o "${id}.mp4" "${url}"`
-    : `yt-dlp ${UA_ARG} ${COOKIES_ARG} -f "bv*[ext=mp4]+ba[ext=m4a]/mp4" -o "${id}.mp4" "${url}"`;
+  // seconds to grab
+  const secs = Number(SECS);
+
+  // Build common args
+  const COMMON = `${UA_ARG} ${COOKIES_ARG} -N 8 --concurrent-fragments 8 --no-part --no-playlist`;
+  const URL = `https://www.youtube.com/watch?v=${id}`;
+
+  let dlCmd;
+  if (status === 'is_live') {
+    // For lives, still grab from start
+    dlCmd = `yt-dlp ${COMMON} --live-from-start -o "${id}.mp4" "${URL}"`;
+  } else {
+    // VOD: fetch only the first N seconds and prefer H.264 ≤720p
+    // --download-sections tells yt-dlp to only pull needed fragments for 0-secs
+    dlCmd =
+      `yt-dlp ${COMMON} ` +
+      `-f "bv*[ext=mp4][vcodec^=avc1][height<=720]+ba[ext=m4a]/mp4" ` +
+      `--download-sections "*0-${secs}" ` +
+      `-o "${id}.mp4" "${URL}"`;
+  }
 
   // simple retry loop (yt-dlp can hiccup)
   for (let i = 0; i <= MAX_RETRIES; i++) {
@@ -212,6 +240,9 @@ async function postToX({ title, videoId, clipPath }) {
 }
 
 (async () => {
+  // Ensure yt-dlp is working at startup
+  ensureYtDlpOk();
+  
   while (true) {
     try {
       console.log(`[yt2x] Polling feed at ${new Date().toISOString()} …`);
