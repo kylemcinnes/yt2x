@@ -122,7 +122,7 @@ function tryExec(cmd) {
   return execSync(cmd, { stdio: 'inherit' });
 }
 
-async function downloadAndClip(id, secs) {
+async function downloadAndClip(id) {
   const url = `https://www.youtube.com/watch?v=${id}`;
   const status = getLiveStatus(id);
 
@@ -133,21 +133,17 @@ async function downloadAndClip(id, secs) {
 
   ensureYtDlpOk();
 
-  // Build common args
-  const COMMON = `${UA_ARG} ${COOKIES_ARG} -N 8 --concurrent-fragments 8 --no-part --no-playlist`;
   const URL = `https://www.youtube.com/watch?v=${id}`;
+  const COMMON = `${UA_ARG} ${COOKIES_ARG} -N 8 --concurrent-fragments 8 --no-part --no-playlist`;
 
   let dlCmd;
   if (status === 'is_live') {
-    // For lives, still grab from start
     dlCmd = `yt-dlp ${COMMON} --live-from-start -o "${id}.mp4" "${URL}"`;
   } else {
-    // VOD: fetch only the first N seconds and prefer H.264 ≤720p
-    // --download-sections tells yt-dlp to only pull needed fragments for 0-secs
     dlCmd =
       `yt-dlp ${COMMON} ` +
       `-f "bv*[ext=mp4][vcodec^=avc1][height<=720]+ba[ext=m4a]/mp4" ` +
-      `--download-sections "*0-${secs}" ` +
+      `--download-sections "*0-${SECS}" ` +
       `-o "${id}.mp4" "${URL}"`;
   }
 
@@ -165,7 +161,7 @@ async function downloadAndClip(id, secs) {
 
   // Transcode to X-friendly MP4 (H.264 yuv420p, AAC-LC, progressive, closed GOP)
   execSync(
-    `ffmpeg -y -ss 0 -t ${secs} -i "${id}.mp4" ` +
+    `ffmpeg -y -ss 0 -t ${SECS} -i "${id}.mp4" ` +
     `-vf "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease,fps=30" ` +
     `-c:v libx264 -profile:v high -pix_fmt yuv420p -preset veryfast ` +
     `-movflags +faststart -g 60 -keyint_min 60 -sc_threshold 0 ` +
@@ -227,13 +223,52 @@ function ensureDirForState() {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-
+// Poll media processing until ready
+async function waitForMediaReady(mediaId) {
+  for (let i = 0; i < 40; i++) {
+    const info = await client.v1.get('media/upload', { command: 'STATUS', media_id: mediaId });
+    const pi = info.processing_info;
+    if (!pi || pi.state === 'succeeded') return;
+    if (pi.state === 'failed') throw new Error(`Media processing failed: ${pi.error?.message || 'unknown'}`);
+    const delay = Math.min((pi.check_after_secs || 2), 10) * 1000;
+    await new Promise(r => setTimeout(r, delay));
+  }
+  throw new Error('Media processing timed out');
+}
 
 async function postToX({ title, videoId, clipPath }) {
-  // Chunked media upload handled by v1 helper internally.
-  const mediaId = await client.v1.uploadMedia(clipPath, { type: 'video/mp4' });
-  const text = `New: ${title} https://youtu.be/${videoId}`;
-  await client.v2.tweet({ text, media: { media_ids: [mediaId] } });
+  const text = `${title}\n\nWatch full on YouTube: https://youtu.be/${videoId}`;
+
+  if (process.env.DRY_RUN === '1') {
+    console.log(`[DRY_RUN] Would upload video and tweet: ${text}`);
+    return;
+  }
+
+  try {
+    // 1) Upload video (chunked) via v1
+    const mediaId = await client.v1.uploadMedia(clipPath, { mimeType: 'video/mp4' });
+
+    // 2) Wait for processing
+    await waitForMediaReady(mediaId);
+
+    // 3) Tweet with native video + YT link
+    await client.v2.tweet({ text, media: { media_ids: [mediaId] } });
+    console.log('[yt2x] Tweeted with native video.');
+  } catch (e) {
+    console.error('[yt2x] Native video tweet failed:', e?.data || e?.message || e);
+
+    // Optional: only allow link-only fallback if explicitly permitted
+    if (process.env.ALLOW_LINK_FALLBACK === '1') {
+      try {
+        await client.v2.tweet({ text });
+        console.warn('[yt2x] Fallback link-only tweet posted.');
+      } catch (e2) {
+        console.error('[yt2x] Fallback link-only failed:', e2?.data || e2?.message || e2);
+      }
+    } else {
+      console.warn('[yt2x] Skipping link-only fallback (set ALLOW_LINK_FALLBACK=1 to enable).');
+    }
+  }
 }
 
 (async () => {
@@ -259,7 +294,7 @@ async function postToX({ title, videoId, clipPath }) {
 
       let paths;
       try {
-        paths = await downloadAndClip(videoId, SECS);
+        paths = await downloadAndClip(videoId);
         if (!paths) {                  // upcoming live → don't write state; just wait
           await sleep(POLL_SECONDS * 1000);
           continue;
@@ -273,43 +308,15 @@ async function postToX({ title, videoId, clipPath }) {
           continue;
         }
 
-        const text = `New: ${title} https://youtu.be/${videoId}`;
         try {
-          if (process.env.DRY_RUN === '1') {
-            console.log(`[DRY_RUN] Would post: ${text} (+ native video)`);
-          } else {
-            const mediaId = await client.v1.uploadMedia(paths.clip, { mimeType: 'video/mp4' });
-            await waitForMediaReady(mediaId);
-            await client.v2.tweet({ text, media: { media_ids: [mediaId] } });
-          }
+          await postToX({ title, videoId, clipPath: paths.clip });
           fs.writeFileSync(STATE, videoId);
         } catch (e) {
           try { await backoffOn429(e, 'tweet'); continue; } catch(_) {}
-          // Fallback: at least post the link (but ONLY if not a live-upcoming)
-          if (paths !== null) {
-            const text = `New: ${title} https://youtu.be/${videoId}`;
-            if (process.env.DRY_RUN === '1') {
-              console.log(`[DRY_RUN] Would post fallback: ${text}`);
-              fs.writeFileSync(STATE, videoId);
-            } else {
-              try { await client.v2.tweet({ text }); fs.writeFileSync(STATE, videoId); }
-              catch (e2) { console.error('[yt2x] Fallback failed:', e2?.message || e2); }
-            }
-          }
+          console.error('[yt2x] Post failed:', e?.message || e);
         }
       } catch (e) {
-        console.error('[yt2x] Post failed:', e?.message || e);
-        // Fallback: at least post the link (but ONLY if not a live-upcoming)
-        if (paths !== null) {
-          const text = `New: ${title} https://youtu.be/${videoId}`;
-          if (process.env.DRY_RUN === '1') {
-            console.log(`[DRY_RUN] Would post fallback: ${text}`);
-            fs.writeFileSync(STATE, videoId);
-          } else {
-            try { await client.v2.tweet({ text }); fs.writeFileSync(STATE, videoId); }
-            catch (e2) { console.error('[yt2x] Fallback failed:', e2?.message || e2); }
-          }
-        }
+        console.error('[yt2x] Download/process failed:', e?.message || e);
       } finally {
         try { if (paths?.original) fs.unlinkSync(paths.original); } catch {}
         try { if (paths?.clip) fs.unlinkSync(paths.clip); } catch {}
