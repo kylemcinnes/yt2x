@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_DIR="/Users/kylemcinnes/Git Repos/yt2x"
-COMPOSE="docker compose"
+# Jump to repo root no matter where this script lives
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# If we're in a subfolder (e.g., scripts/), hop to the git top-level
+if command -v git >/dev/null 2>&1 && git -C "$SCRIPT_DIR" rev-parse --show-toplevel >/dev/null 2>&1; then
+  REPO_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+else
+  REPO_ROOT="$SCRIPT_DIR"
+fi
+cd "$REPO_ROOT"
 
-cd "$PROJECT_DIR"
+COMPOSE="docker compose"
 
 wait_for_docker() {
   for i in {1..30}; do
