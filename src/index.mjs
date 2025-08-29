@@ -11,6 +11,16 @@ const HAS_COOKIES = fs.existsSync(COOKIES_FILE);
 const COOKIES_ARG = HAS_COOKIES ? `--cookies ${COOKIES_FILE}` : '';
 const UA_ARG = '--user-agent "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"';
 
+// Heartbeat for healthcheck
+const HEARTBEAT = '/var/lib/yt2x/heartbeat';
+function touchHeartbeat() {
+  try {
+    fs.writeFileSync(HEARTBEAT, String(Math.floor(Date.now() / 1000)));
+  } catch (e) {
+    console.error('[yt2x] Failed to write heartbeat:', e?.message || e);
+  }
+}
+
 function ensureYtDlpOk() {
   try {
     execSync('yt-dlp --version', { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -182,7 +192,7 @@ async function assertCorrectAccount() {
   }
 }
 
-async function getLatest() {
+async function getUnseenVideos(lastSeenId) {
   try {
     const res = await fetch(FEED, { headers: { 'User-Agent': 'yt2x/1.0' }});
     if (!res.ok) {
@@ -196,12 +206,37 @@ async function getLatest() {
     }
     const xml = await res.text();
     const parsed = new XMLParser().parse(xml);
-    const entry = parsed?.feed?.entry?.[0] || parsed?.entry?.[0] || parsed?.feed?.entry;
-    if (!entry) throw new Error('No entries in RSS');
-    const title = entry.title;
-    const videoId = entry['yt:videoId'];
-    if (!videoId) throw new Error('Missing yt:videoId in feed entry');
-    return { title, videoId };
+    
+    // Get all entries (last ~15 videos)
+    const entries = parsed?.feed?.entry || parsed?.entry || [];
+    if (!Array.isArray(entries)) {
+      throw new Error('No entries in RSS');
+    }
+    
+    // Convert to array of {title, videoId, published} and sort by published date (newest first)
+    const videos = entries
+      .map(entry => ({
+        title: entry.title,
+        videoId: entry['yt:videoId'],
+        published: entry.published
+      }))
+      .filter(v => v.videoId) // filter out any malformed entries
+      .sort((a, b) => new Date(b.published) - new Date(a.published)); // newest first
+    
+    if (videos.length === 0) {
+      throw new Error('No valid video entries found');
+    }
+    
+    // Find the index of lastSeenId in the sorted list
+    const lastSeenIndex = lastSeenId ? videos.findIndex(v => v.videoId === lastSeenId) : -1;
+    
+    // Return all videos after the last seen one (up to 5 per cycle to avoid overwhelming)
+    const unseenVideos = lastSeenIndex >= 0 
+      ? videos.slice(0, lastSeenIndex) // everything before (newer than) lastSeenId
+      : videos.slice(0, 1); // if no lastSeenId, just process the newest
+    
+    // Limit to 5 videos per cycle to avoid overwhelming the system
+    return unseenVideos.slice(0, 5);
   } catch (e) {
     throw e;
   }
@@ -260,49 +295,70 @@ async function postToX({ title, videoId, clipPath, client }) {
   
   while (true) {
     try {
+      touchHeartbeat();
       console.log(`[yt2x] Polling feed at ${new Date().toISOString()} …`);
       
       // Non-blocking identity check (allows YouTube polling to continue)
       await assertCorrectAccountNonBlocking();
       
       ensureDirForState();
-      const { title, videoId } = await getLatest();
-      const seen = fs.existsSync(STATE) ? fs.readFileSync(STATE, 'utf8').trim() : '';
+      const lastSeenId = fs.existsSync(STATE) ? fs.readFileSync(STATE, 'utf8').trim() : '';
+      const unseenVideos = await getUnseenVideos(lastSeenId);
 
-      if (!videoId || videoId === seen) {
-        console.log('[yt2x] No new video. Sleeping…');
+      if (unseenVideos.length === 0) {
+        console.log('[yt2x] No new videos. Sleeping…');
         await sleep(POLL_SECONDS * 1000);
         continue;
       }
 
-      let paths;
-      try {
-        paths = await downloadAndClip(videoId);
-        if (!paths) {                  // upcoming live → don't write state; just wait
-          await sleep(POLL_SECONDS * 1000);
-          continue;
-        }
-
-        // Gate posting on identity confirmation
-        if (!identityOk) {
-          console.log('[yt2x] Waiting for identity confirmation; skipping post this cycle.');
-          // do NOT write state, so we'll try again next poll
-          await sleep(POLL_SECONDS * 1000);
-          continue;
-        }
-
+      console.log(`[yt2x] Found ${unseenVideos.length} unseen video(s). Processing oldest to newest...`);
+      
+      // Process videos from oldest to newest (reverse order)
+      const videosToProcess = [...unseenVideos].reverse();
+      let lastSuccessfullyProcessedId = lastSeenId;
+      
+      for (const { title, videoId } of videosToProcess) {
+        console.log(`[yt2x] Processing video: ${videoId} - ${title}`);
+        
+        let paths;
         try {
-          await postToX({ title, videoId, clipPath: paths.clip, client });
-          fs.writeFileSync(STATE, videoId);
+          paths = await downloadAndClip(videoId);
+          if (!paths) {                  // upcoming live → don't write state; just wait
+            console.log(`[yt2x] Skipping upcoming live: ${videoId}`);
+            continue;
+          }
+
+          // Gate posting on identity confirmation
+          if (!identityOk) {
+            console.log('[yt2x] Waiting for identity confirmation; skipping post this cycle.');
+            // do NOT write state, so we'll try again next poll
+            break; // exit the video processing loop
+          }
+
+          try {
+            await postToX({ title, videoId, clipPath: paths.clip, client });
+            lastSuccessfullyProcessedId = videoId; // only advance state on successful post
+            console.log(`[yt2x] Successfully posted: ${videoId}`);
+          } catch (e) {
+            try { await backoffOn429(e, 'tweet'); break; } catch(_) {}
+            console.error(`[yt2x] Post failed for ${videoId}:`, e?.message || e);
+            // Don't advance state on post failure - will retry next poll
+            break; // exit the video processing loop on post failure
+          }
         } catch (e) {
-          try { await backoffOn429(e, 'tweet'); continue; } catch(_) {}
-          console.error('[yt2x] Post failed:', e?.message || e);
+          console.error(`[yt2x] Download/process failed for ${videoId}:`, e?.message || e);
+          // Don't advance state on download failure - will retry next poll
+          break; // exit the video processing loop on download failure
+        } finally {
+          try { if (paths?.original) fs.unlinkSync(paths.original); } catch {}
+          try { if (paths?.clip) fs.unlinkSync(paths.clip); } catch {}
         }
-      } catch (e) {
-        console.error('[yt2x] Download/process failed:', e?.message || e);
-      } finally {
-        try { if (paths?.original) fs.unlinkSync(paths.original); } catch {}
-        try { if (paths?.clip) fs.unlinkSync(paths.clip); } catch {}
+      }
+      
+      // Only update state file if we successfully processed at least one video
+      if (lastSuccessfullyProcessedId !== lastSeenId) {
+        fs.writeFileSync(STATE, lastSuccessfullyProcessedId);
+        console.log(`[yt2x] Updated state to: ${lastSuccessfullyProcessedId}`);
       }
 
       await sleep(POLL_SECONDS * 1000);
