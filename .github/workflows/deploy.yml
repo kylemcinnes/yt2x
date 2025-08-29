@@ -1,0 +1,74 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Check required secrets
+    runs-on: ubuntu-latest
+    outputs:
+      ok: ${{ steps.chk.outputs.ok }}
+    steps:
+      - id: chk
+        run: |
+          missing=()
+          [ -z "${{ secrets.DEPLOY_HOST }}" ] && missing+=("DEPLOY_HOST")
+          [ -z "${{ secrets.DEPLOY_USER }}" ] && missing+=("DEPLOY_USER")
+          [ -z "${{ secrets.DEPLOY_SSH_KEY }}" ] && missing+=("DEPLOY_SSH_KEY")
+
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "❌ Missing secrets: ${missing[*]}"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "✅ All required secrets present."
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  skip:
+    name: Skip (secrets missing)
+    needs: preflight
+    if: ${{ needs.preflight.outputs.ok != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "Skipping deploy: set DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY in repo Settings -> Secrets and variables -> Actions."
+
+  deploy:
+    name: Deploy
+    needs: preflight
+    if: ${{ needs.preflight.outputs.ok == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            sudo mkdir -p /opt/yt2x
+            sudo chown -R "$USER":"$USER" /opt/yt2x
+            if [ -d /opt/yt2x/.git ]; then
+              cd /opt/yt2x
+              git fetch --all
+              git reset --hard origin/main
+            else
+              git clone --depth=1 https://github.com/kylemcinnes/yt2x /opt/yt2x
+              cd /opt/yt2x
+            fi
+            docker compose up -d --build
+            docker compose ps
