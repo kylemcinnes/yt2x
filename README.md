@@ -13,6 +13,57 @@ When a new YouTube video is published, this service:
   `https://www.youtube.com/feeds/videos.xml?channel_id=UCnaEIU-gr43C7oL3Bzu3dGg`
 - ffmpeg + yt-dlp available (Docker image installs them automatically).
 
+## Troubleshooting: Missed Uploads
+
+If the app appears to be missing YouTube uploads, follow this checklist:
+
+### 1. Check Current State
+```bash
+docker compose exec yt2x sh -lc 'cat /var/lib/yt2x/last.txt'
+```
+
+### 2. Compare with Feed
+```bash
+python3 - <<'PY'
+import urllib.request, xml.etree.ElementTree as ET
+FEED="https://www.youtube.com/feeds/videos.xml?channel_id=UCnaEIU-gr43C7oL3Bzu3dGg"
+xml = urllib.request.urlopen(FEED, timeout=20).read()
+ns = {'a':'http://www.w3.org/2005/Atom','yt':'http://www.youtube.com/xml/schemas/2015'}
+root = ET.fromstring(xml)
+for e in root.findall('a:entry', ns)[:5]:
+    vid = e.find('yt:videoId', ns).text
+    pub = e.find('a:published', ns).text
+    title = e.find('a:title', ns).text
+    print(f"{pub} {vid} {title[:50]}...")
+PY
+```
+
+### 3. Check for State File Corruption
+```bash
+docker compose exec yt2x sh -lc 'cat -A /var/lib/yt2x/last.txt'
+```
+If you see trailing `%` or other junk characters, the state file is corrupted.
+
+### 4. Backfill Missed Videos
+If videos were missed due to failures, use the backfill script:
+```bash
+node scripts/backfill.mjs <older_video_id>
+```
+
+### 5. Verify Batch Processing
+The app should show logs like:
+- `Found X unseen video(s). Processing oldest to newest...`
+- `Processing video: <id> - <title>`
+- `Successfully posted: <id>` (only on success)
+- `Post failed for <id>: <error>` (on failure, state not advanced)
+
+### 6. Check for X API Failures
+Look for these error patterns in logs:
+- `Native video tweet failed: Request failed with code 404`
+- `Post failed for <id>: <error>`
+
+If you see failures, the app will retry on the next poll cycle (state not advanced).
+
 ## Env
 
 Copy `.env.example` → `.env` and fill:
@@ -146,6 +197,29 @@ Push to main; Actions will pull & restart the service.
 
 ## Troubleshooting
 
+### YouTube Signature Extraction Issues
+
+If you encounter "Precondition check failed" or "nsig extraction failed" errors, the service now includes robust fixes:
+
+1. **Automatic yt-dlp Updates**: Uses nightly builds with latest signature extractors
+2. **Cookie Support**: Mounts browser cookies to bypass age/geo/session restrictions
+3. **Modern User-Agent**: Uses current Chrome user-agent string
+
+### Setting Up Cookies (Recommended)
+
+To handle YouTube restrictions:
+
+```bash
+# Run the setup script
+./scripts/setup-cookies.sh
+
+# Or manually:
+# 1. Install "Get cookies.txt" extension in Chrome/Brave
+# 2. Log into YouTube
+# 3. Export cookies to cookies/youtube.txt
+# 4. Restart: docker compose up -d --build
+```
+
 ### Validation Workflow
 
 1. **Leave the service running** - it will continuously poll every 2 minutes
@@ -159,6 +233,7 @@ Push to main; Actions will pull & restart the service.
 
 - **"Live is upcoming"**: Service correctly skips upcoming streams, will retry when live starts
 - **Download failures**: Service automatically retries with exponential backoff
+- **Signature extraction errors**: Service now self-updates yt-dlp and uses cookies
 - **Authentication errors**: Verify X credentials and `X_EXPECTED_USERNAME` match
 - **Missing posts**: Check logs for error messages and fallback behavior
 
