@@ -282,9 +282,11 @@ async function postToX({ title, videoId, clipPath, client }) {
         console.warn('[yt2x] Fallback link-only tweet posted.');
       } catch (e2) {
         console.error('[yt2x] Fallback link-only failed:', e2?.data || e2?.message || e2);
+        throw e2; // Re-throw if fallback also fails
       }
     } else {
       console.warn('[yt2x] Skipping link-only fallback (set ALLOW_LINK_FALLBACK=1 to enable).');
+      throw e; // Re-throw the original error if no fallback
     }
   }
 }
@@ -357,7 +359,7 @@ async function postToX({ title, videoId, clipPath, client }) {
       
       // Only update state file if we successfully processed at least one video
       if (lastSuccessfullyProcessedId !== lastSeenId) {
-        fs.writeFileSync(STATE, lastSuccessfullyProcessedId);
+        fs.writeFileSync(STATE, lastSuccessfullyProcessedId + '\n');
         console.log(`[yt2x] Updated state to: ${lastSuccessfullyProcessedId}`);
       }
 
