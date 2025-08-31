@@ -3,3 +3,6 @@ node_modules
 *.mp4
 run.log
 cookies/
+.DS_Store
+.env.backup
+.state_last.txt
