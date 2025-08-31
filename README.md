@@ -64,6 +64,13 @@ Look for these error patterns in logs:
 
 If you see failures, the app will retry on the next poll cycle (state not advanced).
 
+**CRITICAL**: If X API credentials are invalid/expired, enable link-only fallback:
+```bash
+# In .env, set:
+ALLOW_LINK_FALLBACK=1
+```
+This allows the app to post link-only tweets when video uploads fail, preventing missed videos.
+
 ## Env
 
 Copy `.env.example` → `.env` and fill:
