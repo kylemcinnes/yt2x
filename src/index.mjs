@@ -161,7 +161,7 @@ async function downloadAndClip(id) {
   // Transcode to X-friendly MP4 (H.264 yuv420p, AAC-LC, progressive, closed GOP)
   execSync(
     `ffmpeg -y -ss 0 -t ${SECS} -i "${id}.mp4" ` +
-    `-vf "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease,fps=30" ` +
+    `-vf "scale=1280:720:force_original_aspect_ratio=decrease,fps=30" ` +
     `-c:v libx264 -profile:v high -pix_fmt yuv420p -preset veryfast ` +
     `-movflags +faststart -g 60 -keyint_min 60 -sc_threshold 0 ` +
     `-c:a aac -b:a 128k -ac 2 -ar 44100 clip.mp4`,
@@ -250,12 +250,18 @@ function ensureDirForState() {
 // --- X media processing helper (single definition) ---
 async function waitForMediaReady(client, mediaId) {
   for (let i = 0; i < 40; i++) {
-    const info = await client.v1.get('media/upload', { command: 'STATUS', media_id: mediaId });
-    const pi = info.processing_info;
-    if (!pi || pi.state === 'succeeded') return;
-    if (pi.state === 'failed') throw new Error(`Media processing failed: ${pi.error?.message || 'unknown'}`);
-    const delay = Math.min((pi.check_after_secs || 2), 10) * 1000;
-    await new Promise(r => setTimeout(r, delay));
+    try {
+      const info = await client.v1.get('media/upload', { command: 'STATUS', media_id: mediaId });
+      const pi = info.processing_info;
+      if (!pi || pi.state === 'succeeded') return;
+      if (pi.state === 'failed') throw new Error(`Media processing failed: ${pi.error?.message || 'unknown'}`);
+      const delay = Math.min((pi.check_after_secs || 2), 10) * 1000;
+      await new Promise(r => setTimeout(r, delay));
+    } catch (e) {
+      // If status check fails, assume media is ready and continue
+      console.warn(`[yt2x] Media status check failed, assuming ready: ${e?.message || e}`);
+      return;
+    }
   }
   throw new Error('Media processing timed out');
 }
@@ -342,18 +348,24 @@ async function postToX({ title, videoId, clipPath, client }) {
             lastSuccessfullyProcessedId = videoId; // only advance state on successful post
             console.log(`[yt2x] Successfully posted: ${videoId}`);
           } catch (e) {
-            try { await backoffOn429(e, 'tweet'); break; } catch(_) {}
-            console.error(`[yt2x] Post failed for ${videoId}:`, e?.message || e);
-            // Don't advance state on post failure - will retry next poll
-            break; // exit the video processing loop on post failure
+            try { 
+              await backoffOn429(e, 'tweet'); 
+              break; // If backoffOn429 succeeds (429 handled), exit loop
+            } catch(e2) {
+              // If backoffOn429 fails (not a 429), continue to error handling
+              console.error(`[yt2x] Post failed for ${videoId}:`, e2?.message || e2);
+              // Don't advance state on post failure - will retry next poll
+              break; // exit the video processing loop on post failure
+            }
+          } finally {
+            // Clean up files after upload attempt is complete
+            try { if (paths?.original) fs.unlinkSync(paths.original); } catch {}
+            try { if (paths?.clip) fs.unlinkSync(paths.clip); } catch {}
           }
         } catch (e) {
           console.error(`[yt2x] Download/process failed for ${videoId}:`, e?.message || e);
           // Don't advance state on download failure - will retry next poll
           break; // exit the video processing loop on download failure
-        } finally {
-          try { if (paths?.original) fs.unlinkSync(paths.original); } catch {}
-          try { if (paths?.clip) fs.unlinkSync(paths.clip); } catch {}
         }
       }
       
